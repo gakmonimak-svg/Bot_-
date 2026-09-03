@@ -9,7 +9,7 @@ import { spawn, execFile } from "child_process";
 import fs from "fs";
 
 // ======================================================
-// ضع توكن Telegram هنا
+// ضع توكن Telegram الجديد هنا
 // ======================================================
 
 const TOKEN = "8671197378:AAHAm4HbB9OqzvYpP2CPeI4g4oZHlIwwoDo";
@@ -25,7 +25,7 @@ const FACEBOOK_RTMP =
 // التحقق من التوكن
 // ======================================================
 
-if (!TOKEN || TOKEN === "YOUR_BOT_TOKEN_HERE") {
+if (!TOKEN || TOKEN === "YOUR_NEW_BOT_TOKEN_HERE") {
     console.error("❌ ضع توكن Telegram داخل TOKEN");
     process.exit(1);
 }
@@ -356,6 +356,11 @@ function isMp4Url(sourceUrl) {
 
 // ======================================================
 // بناء FFmpeg
+//
+// الأولوية:
+// STREAM COPY
+//
+// أقل استهلاك CPU.
 // ======================================================
 
 function buildFFmpegArgs(
@@ -386,8 +391,6 @@ function buildFFmpegArgs(
 
     args.push(
 
-        "-re",
-
         "-nostdin",
 
         "-reconnect",
@@ -401,6 +404,9 @@ function buildFFmpegArgs(
 
         "-reconnect_delay_max",
         "10",
+
+        "-rw_timeout",
+        "15000000",
 
         "-i",
         sourceUrl
@@ -417,6 +423,91 @@ function buildFFmpegArgs(
 
         "-map",
         "0:a:0?",
+
+        // ==================================================
+        // STREAM COPY
+        // ==================================================
+
+        "-c:v",
+        "copy",
+
+        "-c:a",
+        "copy",
+
+        // ==================================================
+        // FLV
+        // ==================================================
+
+        "-flvflags",
+        "no_duration_filesize",
+
+        "-f",
+        "flv",
+
+        target
+    );
+
+    return {
+        args,
+        isMp4
+    };
+}
+
+// ======================================================
+// بناء إعادة الترميز الاحتياطية
+//
+// تستخدم فقط إذا فشل Stream Copy.
+// ======================================================
+
+function buildTranscodeArgs(
+    sourceUrl,
+    target
+) {
+
+    const isMp4 =
+        isMp4Url(sourceUrl);
+
+    let args = [];
+
+    if (isMp4) {
+
+        args.push(
+            "-stream_loop",
+            "-1"
+        );
+    }
+
+    args.push(
+
+        "-nostdin",
+
+        "-reconnect",
+        "1",
+
+        "-reconnect_at_eof",
+        "1",
+
+        "-reconnect_streamed",
+        "1",
+
+        "-reconnect_delay_max",
+        "10",
+
+        "-rw_timeout",
+        "15000000",
+
+        "-i",
+        sourceUrl,
+
+        "-map",
+        "0:v:0?",
+
+        "-map",
+        "0:a:0?",
+
+        // ==================================================
+        // H264
+        // ==================================================
 
         "-c:v",
         "libx264",
@@ -447,6 +538,10 @@ function buildFFmpegArgs(
 
         "-bufsize",
         "6000k",
+
+        // ==================================================
+        // AAC
+        // ==================================================
 
         "-c:a",
         "aac",
@@ -479,7 +574,8 @@ async function startStream(
     facebookKey,
     sourceUrl,
     streamType,
-    existingProbe = null
+    existingProbe = null,
+    retryCount = 0
 ) {
 
     name =
@@ -510,7 +606,10 @@ async function startStream(
     // منع تكرار الاسم
     // ==================================================
 
-    if (streams[name]) {
+    if (
+        streams[name] &&
+        !retryCount
+    ) {
 
         await bot.sendMessage(
             chatId,
@@ -524,7 +623,7 @@ async function startStream(
     }
 
     // ==================================================
-    // استخدام نتيجة FFprobe الموجودة
+    // FFprobe
     // ==================================================
 
     let probe =
@@ -559,7 +658,7 @@ async function startStream(
     }
 
     // ==================================================
-    // Facebook RTMPS
+    // Facebook
     // ==================================================
 
     const target =
@@ -567,7 +666,7 @@ async function startStream(
         facebookKey;
 
     // ==================================================
-    // FFmpeg
+    // تحديد طريقة التشغيل
     // ==================================================
 
     const ff =
@@ -581,6 +680,24 @@ async function startStream(
 
     const isMp4 =
         ff.isMp4;
+
+    // ==================================================
+    // إذا كان إعادة تشغيل
+    // ==================================================
+
+    if (
+        streams[name] &&
+        streams[name].process
+    ) {
+
+        try {
+
+            streams[name].process.kill(
+                "SIGKILL"
+            );
+
+        } catch {}
+    }
 
     console.log(
         `▶️ Starting stream: ${name}`
@@ -644,14 +761,18 @@ async function startStream(
             Date.now(),
 
         status:
-            "starting",
+            retryCount > 0
+                ? "reconnecting"
+                : "starting",
 
         manualStop:
             false,
 
         isMp4,
 
-        probe
+        probe,
+
+        retryCount
     };
 
     // ==================================================
@@ -705,6 +826,11 @@ async function startStream(
                     "running";
             }
 
+            // لا ترسل رسالة جديدة عند إعادة الاتصال
+            if (retryCount > 0) {
+                return;
+            }
+
             try {
 
                 await bot.sendMessage(
@@ -726,6 +852,9 @@ async function startStream(
 
                     `🔄 MP4 Loop:\n` +
                     `${isMp4 ? "مفعّل ✅" : "غير مطلوب"}\n\n` +
+
+                    `⚡ الوضع:\n` +
+                    `Stream Copy\n\n` +
 
                     `🟢 الحالة:\nيعمل`,
 
@@ -757,14 +886,15 @@ async function startStream(
                 !stream.manualStop
             ) {
 
-                delete streams[name];
+                stream.status =
+                    "error";
 
                 try {
 
                     await bot.sendMessage(
                         chatId,
 
-                        `❌ حدث خطأ في بث "${name}"\n\n` +
+                        `⚠️ خطأ في FFmpeg للبث "${name}"\n\n` +
                         error.message,
 
                         mainKeyboard()
@@ -806,25 +936,58 @@ async function startStream(
                     stream.manualStop
                 );
 
-            delete streams[name];
+            // ==================================================
+            // إيقاف يدوي
+            // ==================================================
 
             if (manualStop) {
+
+                delete streams[name];
+
                 return;
             }
 
-            try {
+            // ==================================================
+            // إعادة الاتصال تلقائيًا
+            // ==================================================
 
-                await bot.sendMessage(
-                    chatId,
+            stream.status =
+                "reconnecting";
 
-                    `🛑 توقف البث "${name}"\n\n` +
-                    `كود FFmpeg: ${code ?? "غير معروف"}\n\n` +
-                    `🔗 المصدر:\n${sourceUrl}`,
+            const nextRetry =
+                (stream.retryCount || 0) + 1;
 
-                    mainKeyboard()
-                );
+            console.log(
+                `🔄 Reconnecting ${name}, attempt ${nextRetry}`
+            );
 
-            } catch {}
+            // ==================================================
+            // لا نحذف البث
+            // ==================================================
+
+            setTimeout(
+                async () => {
+
+                    if (
+                        !streams[name] ||
+                        streams[name].manualStop
+                    ) {
+                        return;
+                    }
+
+                    await startStream(
+                        chatId,
+                        name,
+                        facebookKey,
+                        sourceUrl,
+                        streamType,
+                        probe,
+                        nextRetry
+                    );
+
+                },
+                5000
+            );
         }
     );
 
@@ -832,11 +995,7 @@ async function startStream(
 }
 
 // ======================================================
-// ⭐ GROUP جديد
-//
-// يجمع كل المعلومات أولاً
-// ثم يفحص كل الروابط
-// ثم يشغل جميع FFmpeg معاً
+// GROUP
 // ======================================================
 
 async function startGroupStreams(
@@ -861,7 +1020,7 @@ async function startGroupStreams(
     }
 
     // ==================================================
-    // المرحلة 1: فحص جميع الروابط أولاً
+    // فحص جميع الروابط
     // ==================================================
 
     await bot.sendMessage(
@@ -924,7 +1083,7 @@ async function startGroupStreams(
     }
 
     // ==================================================
-    // التأكد من عدم وجود أسماء مكررة
+    // أسماء مكررة
     // ==================================================
 
     const names =
@@ -954,7 +1113,7 @@ async function startGroupStreams(
     }
 
     // ==================================================
-    // التأكد أن الأسماء غير مستخدمة
+    // التأكد من عدم وجود بث يعمل
     // ==================================================
 
     for (
@@ -977,7 +1136,7 @@ async function startGroupStreams(
     }
 
     // ==================================================
-    // جميع الروابط صالحة
+    // تشغيل GROUP
     // ==================================================
 
     await bot.sendMessage(
@@ -987,16 +1146,13 @@ async function startGroupStreams(
 
         `📊 عدد البثوث: ${checkedStreams.length}\n\n` +
 
-        `🚀 سيتم الآن تشغيل جميع البثوث معًا...`
+        `⚡ الوضع: Stream Copy\n\n` +
+
+        `🚀 سيتم الآن تشغيل جميع البثوث...`
     );
 
     // ==================================================
-    // ⭐ التشغيل المتزامن
-    //
-    // مهم:
-    // لا نستخدم await بين البثوث.
-    // نقوم بإنشاء جميع عمليات FFmpeg بسرعة
-    // ثم ننتظر نتائج التشغيل.
+    // تشغيل متزامن
     // ==================================================
 
     const startPromises =
@@ -1023,7 +1179,7 @@ async function startGroupStreams(
         ).length;
 
     // ==================================================
-    // النتيجة النهائية
+    // النتيجة
     // ==================================================
 
     let resultText =
@@ -1234,6 +1390,8 @@ async function showStatus(
 
             `📡 ${stream.type}\n` +
 
+            `⚡ Stream Copy\n` +
+
             `🔄 MP4 Loop: ` +
             `${stream.isMp4 ? "نعم" : "لا"}\n\n`;
     }
@@ -1299,6 +1457,8 @@ async function showStreamStatus(
         `🎥 الفيديو: ${stream.probe?.video || "غير معروف"}\n` +
 
         `🔊 الصوت: ${stream.probe?.audio || "غير معروف"}\n` +
+
+        `⚡ الوضع: Stream Copy\n` +
 
         `🔄 MP4 Loop: ${stream.isMp4 ? "نعم" : "لا"}\n\n` +
 
@@ -1656,7 +1816,7 @@ bot.on(
             }
 
             // ==========================================
-            // ⭐ GROUP
+            // GROUP
             // ==========================================
 
             if (
@@ -1745,11 +1905,6 @@ bot.on(
                     session.step === "url"
                 ) {
 
-                    // ==================================
-                    // ⭐ فقط جمع المعلومات
-                    // لا يبدأ FFmpeg هنا
-                    // ==================================
-
                     session.streams.push({
 
                         name:
@@ -1761,10 +1916,6 @@ bot.on(
                         url:
                             text
                     });
-
-                    // ==================================
-                    // إذا لم نصل إلى آخر بث
-                    // ==================================
 
                     if (
                         session.current <
@@ -1784,18 +1935,10 @@ bot.on(
                         );
                     }
 
-                    // ==================================
-                    // ⭐ اكتملت جميع المعلومات
-                    // ==================================
-
                     const groupStreams =
                         [...session.streams];
 
                     delete sessions[userId];
-
-                    // ==================================
-                    // الآن فقط يبدأ الفحص ثم التشغيل
-                    // ==================================
 
                     await startGroupStreams(
                         chatId,
